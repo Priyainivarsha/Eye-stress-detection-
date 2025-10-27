@@ -1,0 +1,177 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import cv2
+import time
+import mediapipe as mp
+import numpy as np
+import threading
+import pyttsx3
+from collections import deque
+import matplotlib.pyplot as plt
+
+# --- Threaded TTS ---
+def speak(message):
+    def run_speak(msg):
+        engine = pyttsx3.init()
+        engine.say(msg)
+        engine.runAndWait()
+    threading.Thread(target=run_speak, args=(message,)).start()
+
+# Mediapipe setup
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
+face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1)
+
+# EAR calculation
+def eye_aspect_ratio(landmarks, eye_indices, w, h):
+    points = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in eye_indices]
+    A = np.linalg.norm(np.array(points[1]) - np.array(points[5]))
+    B = np.linalg.norm(np.array(points[2]) - np.array(points[4]))
+    C = np.linalg.norm(np.array(points[0]) - np.array(points[3]))
+    ear = (A + B) / (2.0 * C)
+    return ear
+
+# Eye indices
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+
+# Parameters
+EAR_THRESHOLD = 0.2
+BLINK_DURATION = 0.2
+OBSERVE_TIME = 60          # 1 minute
+SLEEP_TIME = 180           # 3 minutes of 0 blink → sleeping
+
+cap = cv2.VideoCapture(0)
+
+blink_count = 0
+blink_start_time = None
+start_window = time.time()
+last_blink_time = time.time()
+status_message = "Monitoring..."
+
+# --- Last 5 status readings ---
+last_statuses = deque(maxlen=5)
+status_map = {
+    "Sleeping": 0,
+    "No blinks - Monitoring...": 0,
+    "Low blink rate": 1,
+    "Normal": 2,
+    "Eyes are stressed": 3
+}
+
+def plot_status_graphs(status_list):
+    if not status_list:
+        return
+    numeric_vals = [status_map[s] for s in status_list]
+
+    plt.figure(figsize=(12,4))
+
+    # Bar chart
+    plt.subplot(1,3,1)
+    plt.bar(range(1, len(numeric_vals)+1), numeric_vals, color='skyblue')
+    plt.title("Last 5 Status Readings - Bar Chart")
+    plt.xticks(range(1, len(status_list)+1), status_list, rotation=45)
+
+    # Scatter plot
+    plt.subplot(1,3,2)
+    plt.scatter(range(1, len(numeric_vals)+1), numeric_vals, color='red', s=100)
+    plt.title("Last 5 Status Readings - Scatter Plot")
+    plt.xticks(range(1, len(status_list)+1), status_list, rotation=45)
+
+    # Pie chart
+    plt.subplot(1,3,3)
+    unique_statuses = list(dict.fromkeys(status_list))  # preserve order
+    counts = [status_list.count(s) for s in unique_statuses]
+    plt.pie(counts, labels=unique_statuses, autopct='%1.1f%%', colors=plt.cm.Pastel1.colors)
+    plt.title("Last 5 Status Readings - Pie Chart")
+
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(0.1)
+    plt.clf()
+
+# --- Main loop ---
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    h, w, _ = frame.shape
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb_frame)
+
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
+            # Draw face mesh
+            mp_drawing.draw_landmarks(
+                frame,
+                face_landmarks,
+                mp_face_mesh.FACEMESH_CONTOURS,
+                landmark_drawing_spec=drawing_spec,
+                connection_drawing_spec=drawing_spec
+            )
+
+            # EAR
+            left_ear = eye_aspect_ratio(face_landmarks.landmark, LEFT_EYE, w, h)
+            right_ear = eye_aspect_ratio(face_landmarks.landmark, RIGHT_EYE, w, h)
+            ear = (left_ear + right_ear) / 2.0
+
+            # Blink detection
+            if ear < EAR_THRESHOLD:
+                if blink_start_time is None:
+                    blink_start_time = time.time()
+            else:
+                if blink_start_time is not None:
+                    if time.time() - blink_start_time >= BLINK_DURATION:
+                        blink_count += 1
+                        last_blink_time = time.time()
+                    blink_start_time = None
+
+            # --- Observation window ---
+            elapsed = time.time() - start_window
+            if elapsed >= OBSERVE_TIME:
+                # Determine status
+                if blink_count > 20:
+                    status_message = "Eyes are stressed"
+                    speak("Eyes are stressed")
+                elif 7 <= blink_count <= 20:
+                    status_message = "Normal"
+                    speak("Normal eye condition")
+                elif blink_count == 0:
+                    status_message = "No blinks - Monitoring..."
+                    speak("No blinks")
+                else:
+                    status_message = "Low blink rate"
+                    speak("Low blink rate")
+
+                # Update last 5 statuses and plot
+                last_statuses.append(status_message)
+                plot_status_graphs(list(last_statuses))
+
+                blink_count = 0
+                start_window = time.time()
+
+            # --- Sleep check ---
+            if time.time() - last_blink_time >= SLEEP_TIME:
+                status_message = "Sleeping"
+                speak("Sleeping")
+                last_blink_time = time.time()
+
+            # Overlay info
+            cv2.putText(frame, f"EAR: {ear:.2f}", (30, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f"Blinks: {blink_count}", (30, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"Status: {status_message}", (30, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+    cv2.imshow("Eye Stress & Sleep Detection", frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+plt.close()
